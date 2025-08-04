@@ -1783,13 +1783,12 @@ app.post('/api/csint/search', csintLimiter, requireLogin, async (req, res) => {
     
     const { service, params } = req.body;
     
-    // Validate input
-    if (!service || typeof service !== 'string' || service.trim() === '') {
+    // Basic validation
+    if (!service || typeof service !== 'string') {
         return res.status(400).json({ 
             success: false,
-            error: 'Service parameter is required and must be a non-empty string.',
-            version: 'v2',
-            timestamp: new Date().toISOString()
+            error: 'Service parameter is required and must be a string.',
+            version: 'v2'
         });
     }
     
@@ -1797,134 +1796,104 @@ app.post('/api/csint/search', csintLimiter, requireLogin, async (req, res) => {
         return res.status(400).json({ 
             success: false,
             error: 'Params parameter is required and must be an object.',
-            version: 'v2',
-            timestamp: new Date().toISOString()
-        });
-    }
-
-    // List of valid services from the API documentation
-    const validServices = [
-        'email_intel', 'phone_intel', 'user_intel', 'seon', 'tlo', 'Intellius', 
-        'court', 'caller', 'telegram', 'intelx', 'discord', 'epicgames', 
-        'github', 'blockchain', 'ip', 'roblox', 'microsoft', 'stealer', 
-        'dblookup', 'live_email', 'live_phone', 'breach', 'community', 
-        'twitter', 'minecraft', 'portal'
-    ];
-    
-    if (!validServices.includes(service)) {
-        return res.status(400).json({ 
-            success: false,
-            error: `Invalid service. Valid services are: ${validServices.join(', ')}`,
-            version: 'v2',
-            timestamp: new Date().toISOString()
+            version: 'v2'
         });
     }
 
     try {
-        console.log('CSINT API Request:', { service, params });
-        
         const apiRes = await fetch(`${CSINT_BASE_URL}/api/v2/search`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'Authorization': CSINT_API_KEY
             },
-            body: JSON.stringify({ service, params }),
-            timeout: 30000 // 30 second timeout
+            body: JSON.stringify({ service, params })
         });
-
-        console.log('CSINT API Response Status:', apiRes.status);
-        console.log('CSINT API Response Headers:', Object.fromEntries(apiRes.headers.entries()));
 
         const contentType = apiRes.headers.get('content-type');
         
+        // Handle JSON responses
         if (contentType && contentType.includes('application/json')) {
             const data = await apiRes.json();
-            console.log('CSINT API JSON Response:', data);
             
             if (!apiRes.ok) {
                 return res.status(apiRes.status).json({
                     success: false,
-                    error: data.error || data.message || `HTTP error! status: ${apiRes.status}`,
-                    details: data,
-                    version: 'v2',
-                    timestamp: new Date().toISOString()
+                    error: data.error || data.message || `API error: ${apiRes.status}`,
+                    version: 'v2'
                 });
             }
             
-            // Log successful search
-            logSecurityEvent('CSINT_SEARCH', { 
-                user: req.session.user.username, 
-                service,
-                success: true
-            });
-            
-            res.json({
+            return res.json({
                 success: true,
                 ...data,
-                version: 'v2',
-                timestamp: new Date().toISOString()
+                version: 'v2'
             });
-        } else {
-            // Handle non-JSON responses (like streaming or text responses)
+        }
+        
+        // Handle streaming responses (NDJSON)
+        if (contentType && contentType.includes('application/x-ndjson')) {
             const text = await apiRes.text();
-            console.log('CSINT API Text Response:', text);
             
             if (!apiRes.ok) {
                 return res.status(apiRes.status).json({
                     success: false,
-                    error: text || `HTTP error! status: ${apiRes.status}`,
-                    version: 'v2',
-                    timestamp: new Date().toISOString()
+                    error: text || `API error: ${apiRes.status}`,
+                    version: 'v2'
                 });
             }
             
-            // For streaming responses, try to parse as JSON lines
-            try {
-                const lines = text.split('\n').filter(line => line.trim());
-                const results = lines.map(line => JSON.parse(line));
-                
-                res.json({
-                    success: true,
-                    data: results,
-                    version: 'v2',
-                    timestamp: new Date().toISOString()
-                });
-            } catch (parseErr) {
-                // If not JSON lines, return as text
-                res.json({
-                    success: true,
-                    data: text,
-                    version: 'v2',
-                    timestamp: new Date().toISOString()
-                });
+            // Parse NDJSON (newline-delimited JSON)
+            const lines = text.split('\n').filter(line => line.trim());
+            const results = [];
+            
+            for (const line of lines) {
+                try {
+                    results.push(JSON.parse(line));
+                } catch (e) {
+                    // Skip invalid JSON lines
+                    continue;
+                }
             }
+            
+            return res.json({
+                success: true,
+                data: results,
+                version: 'v2'
+            });
         }
+        
+        // Handle other text responses
+        const text = await apiRes.text();
+        
+        if (!apiRes.ok) {
+            return res.status(apiRes.status).json({
+                success: false,
+                error: text || `API error: ${apiRes.status}`,
+                version: 'v2'
+            });
+        }
+        
+        return res.json({
+            success: true,
+            data: text,
+            version: 'v2'
+        });
+        
     } catch (err) {
         console.error('CSINT API Error:', err);
         logSecurityEvent('CSINT_ERROR', { 
             user: req.session?.user?.username, 
             error: err.message, 
-            service,
-            params
+            service
         });
         
-        if (err.name === 'AbortError' || err.message.includes('timeout')) {
-            res.status(504).json({
-                success: false,
-                error: 'CSINT API timeout - request took too long',
-                version: 'v2',
-                timestamp: new Date().toISOString()
-            });
-        } else {
-            res.status(500).json({
-                success: false,
-                error: 'CSINT API error',
-                details: err.message,
-                version: 'v2',
-                timestamp: new Date().toISOString()
-            });
-        }
+        return res.status(500).json({
+            success: false,
+            error: 'Internal server error',
+            details: err.message,
+            version: 'v2'
+        });
     }
 });
 
