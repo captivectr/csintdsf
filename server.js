@@ -393,6 +393,10 @@ app.post('/generate-key', async (req, res) => {
 
 const onlineUsers = new Set();
 const connectedClients = new Map();
+const searchStats = {
+    searches: 0,
+    failed: 0
+};
 
 function broadcastAnnouncement(announcement) {
     const message = JSON.stringify({
@@ -1768,13 +1772,33 @@ app.post('/api/csint/search', csintLimiter, requireLogin, async (req, res) => {
         return res.status(403).json({ error: 'Upgrade your plan to use this feature.' });
     }
     
-    const { service, params } = req.body;
-    if (!service || typeof params !== 'object') {
-        return res.status(400).json({ error: 'Invalid request. Service and params are required.' });
+    if (req.session.user.rate_limited) {
+        const now = Date.now();
+        if (!req.session.user.lastCsintTime || now - req.session.user.lastCsintTime > 60000) {
+            req.session.user.lastCsintTime = now;
+        } else {
+            return res.status(429).json({ error: 'You are rate limited. Please wait before searching again.' });
+        }
     }
-
-    const CSINT_BASE_URL = process.env.CSINT_BASE_URL || 'https://csint.tools';
-    const CSINT_API_KEY = process.env.CSINT_API_KEY || "848914919401-priv";
+    
+    const { service, params } = req.body;
+    
+    // Basic validation
+    if (!service || typeof service !== 'string') {
+        return res.status(400).json({ 
+            success: false,
+            error: 'Service parameter is required and must be a string.',
+            version: 'v2'
+        });
+    }
+    
+    if (!params || typeof params !== 'object' || Array.isArray(params)) {
+        return res.status(400).json({ 
+            success: false,
+            error: 'Params parameter is required and must be an object.',
+            version: 'v2'
+        });
+    }
 
     try {
         const apiRes = await fetch(`${CSINT_BASE_URL}/api/v2/search`, {
@@ -1788,35 +1812,87 @@ app.post('/api/csint/search', csintLimiter, requireLogin, async (req, res) => {
 
         const contentType = apiRes.headers.get('content-type');
         
+        // Handle JSON responses
         if (contentType && contentType.includes('application/json')) {
             const data = await apiRes.json();
+            
             if (!apiRes.ok) {
                 return res.status(apiRes.status).json({
                     success: false,
-                    error: data.error || `HTTP error! status: ${apiRes.status}`,
-                    version: 'v2',
-                    timestamp: new Date().toISOString()
+                    error: data.error || data.message || `API error: ${apiRes.status}`,
+                    version: 'v2'
                 });
             }
-            res.json(data);
-        } else {
-            // Handle non-JSON responses
-            const text = await apiRes.text();
-            res.status(apiRes.status).json({
-                success: false,
-                error: text || `HTTP error! status: ${apiRes.status}`,
-                version: 'v2',
-                timestamp: new Date().toISOString()
+            
+            return res.json({
+                success: true,
+                ...data,
+                version: 'v2'
             });
         }
+        
+        // Handle streaming responses (NDJSON)
+        if (contentType && contentType.includes('application/x-ndjson')) {
+            const text = await apiRes.text();
+            
+            if (!apiRes.ok) {
+                return res.status(apiRes.status).json({
+                    success: false,
+                    error: text || `API error: ${apiRes.status}`,
+                    version: 'v2'
+                });
+            }
+            
+            // Parse NDJSON (newline-delimited JSON)
+            const lines = text.split('\n').filter(line => line.trim());
+            const results = [];
+            
+            for (const line of lines) {
+                try {
+                    results.push(JSON.parse(line));
+                } catch (e) {
+                    // Skip invalid JSON lines
+                    continue;
+                }
+            }
+            
+            return res.json({
+                success: true,
+                data: results,
+                version: 'v2'
+            });
+        }
+        
+        // Handle other text responses
+        const text = await apiRes.text();
+        
+        if (!apiRes.ok) {
+            return res.status(apiRes.status).json({
+                success: false,
+                error: text || `API error: ${apiRes.status}`,
+                version: 'v2'
+            });
+        }
+        
+        return res.json({
+            success: true,
+            data: text,
+            version: 'v2'
+        });
+        
     } catch (err) {
         console.error('CSINT API Error:', err);
-        res.status(500).json({
+        logSecurityEvent('CSINT_ERROR', { 
+            user: req.session?.user?.username, 
+            error: err.message, 
+            service
+        });
+        
+        return res.status(500).json({
             success: false,
-            error: 'CSINT API error',
+            error: 'Internal server error',
             details: err.message,
-            version: 'v2',
-            timestamp: new Date().toISOString()
+            version: 'v2'
         });
     }
 });
